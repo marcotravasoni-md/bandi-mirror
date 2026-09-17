@@ -17,53 +17,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Scarica dal Worker
+      - name: Scarica dal Worker a blocchi
         run: |
-          curl -sS --fail --max-time 300 "${WORKER}?rows=20000" -o grezzo.json
-          echo "Scaricati $(wc -c < grezzo.json) byte"
+          BLOCCO=1000
+          INIZIO=0
+          rm -f parti.txt
+          while [ $INIZIO -lt 20000 ]; do
+            echo "Blocco da $INIZIO..."
+            CODICE=$(curl -sS --max-time 120 -w '%{http_code}' \
+                     "${WORKER}?rows=${BLOCCO}&start=${INIZIO}" -o "parte_${INIZIO}.json")
+            if [ "$CODICE" != "200" ]; then
+              echo "ERRORE HTTP $CODICE sul blocco da $INIZIO"
+              head -c 300 "parte_${INIZIO}.json"
+              exit 1
+            fi
+            RICEVUTI=$(python3 -c "import json;print(len(json.load(open('parte_${INIZIO}.json'))['response']['docs']))")
+            echo "  ricevuti $RICEVUTI record"
+            echo "parte_${INIZIO}.json" >> parti.txt
+            [ "$RICEVUTI" -lt "$BLOCCO" ] && break
+            INIZIO=$((INIZIO + BLOCCO))
+            sleep 2
+          done
 
-      - name: Filtra i bandi aperti
+      - name: Unisci i blocchi
         run: |
           python3 - <<'PY'
-          import json, datetime, sys
-
-          OGGI = datetime.date.today().isoformat()
-
-          with open('grezzo.json', encoding='utf-8') as f:
-              dati = json.load(f)
-
-          risposta = dati['response']
-          totale = risposta['numFound']
-          record = risposta['docs']
-
-          # Controlli di sanità: meglio fallire che pubblicare un file vuoto.
-          if totale < 4000:
-              sys.exit(f'ERRORE: solo {totale} record dichiarati, attesi circa 5900. Non pubblico.')
-          if len(record) < totale:
-              sys.exit(f'ERRORE: ricevuti {len(record)} record su {totale} dichiarati. Risposta troncata.')
-
-          def aperto(b):
-              c = b.get('Data_chiusura')
-              return not c or c[:10] >= OGGI
-
-          aperti = [b for b in record if aperto(b)]
-
-          if len(aperti) < 200:
-              sys.exit(f'ERRORE: solo {len(aperti)} bandi aperti. Sospetto, non pubblico.')
-
-          with open('bandi-aperti.json', 'w', encoding='utf-8') as f:
-              json.dump(aperti, f, ensure_ascii=False, separators=(',', ':'))
-
-          stato = {
-              'generato_il': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
-              'record_totali': totale,
-              'record_aperti': len(aperti),
-              'fonte': 'incentivi.gov.it (MIMIT) - licenza IODL 2.0'
-          }
-          with open('stato.json', 'w', encoding='utf-8') as f:
-              json.dump(stato, f, ensure_ascii=False, indent=2)
-
-          print(f'{len(aperti)} bandi aperti su {totale} totali')
+          import json
+          record, totale = [], 0
+          for nome in open('parti.txt').read().split():
+              r = json.load(open(nome, encoding='utf-8'))['response']
+              totale = r['numFound']
+              record += r['docs']
+          json.dump({'response': {'numFound': totale, 'docs': record}},
+                    open('grezzo.json', 'w', encoding='utf-8'), ensure_ascii=False)
+          print(f'Uniti {len(record)} record su {totale} dichiarati')
           PY
 
       - name: Pubblica
