@@ -1,56 +1,75 @@
-name: Aggiorna bandi
+name: Prepara bandi
 
 on:
-  workflow_dispatch:        # avvio manuale dal pulsante
-  schedule:
-    - cron: '0 5 * * *'     # ogni giorno alle 07:00 italiane
+  workflow_dispatch:
+  push:
+    paths:
+      - 'opendata-export.json'
+      - 'grezzo.json'
 
 permissions:
   contents: write
 
-env:
-  WORKER: https://rapid-hat-ad56.marco-travasoni.workers.dev/
-
 jobs:
-  aggiorna:
+  prepara:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Scarica dal Worker a blocchi
-        run: |
-          BLOCCO=200
-          INIZIO=0
-          rm -f parti.txt
-          while [ $INIZIO -lt 20000 ]; do
-            echo "Blocco da $INIZIO..."
-            CODICE=$(curl -sS --max-time 120 -w '%{http_code}' \
-                     "${WORKER}?rows=${BLOCCO}&start=${INIZIO}" -o "parte_${INIZIO}.json")
-            if [ "$CODICE" != "200" ]; then
-              echo "ERRORE HTTP $CODICE sul blocco da $INIZIO"
-              head -c 300 "parte_${INIZIO}.json"
-              exit 1
-            fi
-            RICEVUTI=$(python3 -c "import json;print(len(json.load(open('parte_${INIZIO}.json'))['response']['docs']))")
-            echo "  ricevuti $RICEVUTI record"
-            echo "parte_${INIZIO}.json" >> parti.txt
-            [ "$RICEVUTI" -lt "$BLOCCO" ] && break
-            INIZIO=$((INIZIO + BLOCCO))
-            sleep 2
-          done
-
-      - name: Unisci i blocchi
+      - name: Filtra e normalizza
         run: |
           python3 - <<'PY'
-          import json
-          record, totale = [], 0
-          for nome in open('parti.txt').read().split():
-              r = json.load(open(nome, encoding='utf-8'))['response']
-              totale = r['numFound']
-              record += r['docs']
-          json.dump({'response': {'numFound': totale, 'docs': record}},
-                    open('grezzo.json', 'w', encoding='utf-8'), ensure_ascii=False)
-          print(f'Uniti {len(record)} record su {totale} dichiarati')
+          import json, datetime, glob, sys
+
+          OGGI = datetime.date.today().isoformat()
+
+          # Accetta sia grezzo.json sia il file scaricato dal portale,
+          # comunque si chiami.
+          candidati = ['grezzo.json'] + sorted(glob.glob('opendata-export*.json'))
+          origine = next((n for n in candidati if glob.glob(n)), None)
+          if not origine:
+              sys.exit('ERRORE: nessun file di origine trovato nel repository.')
+          print(f'Origine: {origine}')
+
+          with open(origine, encoding='utf-8-sig') as f:
+              dati = json.load(f)
+
+          # Il file può essere un elenco semplice oppure la risposta Solr.
+          if isinstance(dati, dict):
+              record = dati['response']['docs']
+          else:
+              record = dati
+
+          if len(record) < 4000:
+              sys.exit(f'ERRORE: solo {len(record)} record, attesi circa 5900. Non pubblico.')
+
+          def aperto(b):
+              c = b.get('Data_chiusura')
+              return not c or c[:10] >= OGGI
+
+          aperti = [b for b in record if aperto(b)]
+
+          if len(aperti) < 200:
+              sys.exit(f'ERRORE: solo {len(aperti)} bandi aperti. Sospetto, non pubblico.')
+
+          # Ordina per scadenza più vicina; gli sportelli senza data in fondo.
+          aperti.sort(key=lambda b: b.get('Data_chiusura') or '9999')
+
+          with open('bandi-aperti.json', 'w', encoding='utf-8') as f:
+              json.dump(aperti, f, ensure_ascii=False, separators=(',', ':'))
+
+          stato = {
+              'generato_il': datetime.datetime.now(datetime.timezone.utc)
+                              .isoformat(timespec='seconds'),
+              'record_totali': len(record),
+              'record_aperti': len(aperti),
+              'senza_scadenza': sum(1 for b in aperti if not b.get('Data_chiusura')),
+              'fonte': 'incentivi.gov.it (MIMIT) - licenza IODL 2.0'
+          }
+          with open('stato.json', 'w', encoding='utf-8') as f:
+              json.dump(stato, f, ensure_ascii=False, indent=2)
+
+          print(f'{len(aperti)} bandi aperti su {len(record)} totali')
           PY
 
       - name: Pubblica
@@ -59,5 +78,5 @@ jobs:
           git config user.email "actions@github.com"
           git add bandi-aperti.json stato.json
           git diff --staged --quiet && echo "Nessuna modifica" && exit 0
-          git commit -m "Aggiornamento bandi $(date +%F)"
+          git commit -m "Bandi aggiornati $(date +%F)"
           git push
