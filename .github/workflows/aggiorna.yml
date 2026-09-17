@@ -19,7 +19,7 @@ jobs:
 
       - name: Scarica dal Worker a blocchi
         run: |
-          BLOCCO=1000
+          BLOCCO=200
           INIZIO=0
           rm -f parti.txt
           while [ $INIZIO -lt 20000 ]; do
