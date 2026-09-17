@@ -1,0 +1,76 @@
+name: Aggiorna bandi
+
+on:
+  workflow_dispatch:        # avvio manuale dal pulsante
+  schedule:
+    - cron: '0 5 * * *'     # ogni giorno alle 07:00 italiane
+
+permissions:
+  contents: write
+
+env:
+  WORKER: https://rapid-hat-ad56.marco-travasoni.workers.dev/
+
+jobs:
+  aggiorna:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scarica dal Worker
+        run: |
+          curl -sS --fail --max-time 300 "${WORKER}?rows=20000" -o grezzo.json
+          echo "Scaricati $(wc -c < grezzo.json) byte"
+
+      - name: Filtra i bandi aperti
+        run: |
+          python3 - <<'PY'
+          import json, datetime, sys
+
+          OGGI = datetime.date.today().isoformat()
+
+          with open('grezzo.json', encoding='utf-8') as f:
+              dati = json.load(f)
+
+          risposta = dati['response']
+          totale = risposta['numFound']
+          record = risposta['docs']
+
+          # Controlli di sanità: meglio fallire che pubblicare un file vuoto.
+          if totale < 4000:
+              sys.exit(f'ERRORE: solo {totale} record dichiarati, attesi circa 5900. Non pubblico.')
+          if len(record) < totale:
+              sys.exit(f'ERRORE: ricevuti {len(record)} record su {totale} dichiarati. Risposta troncata.')
+
+          def aperto(b):
+              c = b.get('Data_chiusura')
+              return not c or c[:10] >= OGGI
+
+          aperti = [b for b in record if aperto(b)]
+
+          if len(aperti) < 200:
+              sys.exit(f'ERRORE: solo {len(aperti)} bandi aperti. Sospetto, non pubblico.')
+
+          with open('bandi-aperti.json', 'w', encoding='utf-8') as f:
+              json.dump(aperti, f, ensure_ascii=False, separators=(',', ':'))
+
+          stato = {
+              'generato_il': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+              'record_totali': totale,
+              'record_aperti': len(aperti),
+              'fonte': 'incentivi.gov.it (MIMIT) - licenza IODL 2.0'
+          }
+          with open('stato.json', 'w', encoding='utf-8') as f:
+              json.dump(stato, f, ensure_ascii=False, indent=2)
+
+          print(f'{len(aperti)} bandi aperti su {totale} totali')
+          PY
+
+      - name: Pubblica
+        run: |
+          git config user.name "aggiornamento automatico"
+          git config user.email "actions@github.com"
+          git add bandi-aperti.json stato.json
+          git diff --staged --quiet && echo "Nessuna modifica" && exit 0
+          git commit -m "Aggiornamento bandi $(date +%F)"
+          git push
